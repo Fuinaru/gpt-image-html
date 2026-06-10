@@ -85,6 +85,9 @@
   button.btn:hover { background: var(--accent-2); }
   button.btn:disabled { opacity: .5; cursor: not-allowed; }
   button.ghost { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); width: auto; padding: 9px 14px; }
+  button.danger { background: var(--danger); border-color: var(--danger); color: #fff; animation: pulse 1.4s ease-in-out infinite; }
+  button.danger:hover { background: #e85555; }
+  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(255,107,107,.5); } 50% { box-shadow: 0 0 0 6px rgba(255,107,107,0); } }
 
   .result { min-height: 260px; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 14px; }
   .result .placeholder { color: var(--muted); font-size: 14px; }
@@ -110,6 +113,10 @@
   .hist-item .hist-img { width: 100%; aspect-ratio: 1; object-fit: cover; cursor: pointer; display: block; background: #0c0e12; }
   .hist-meta { padding: 8px 10px; font-size: 12px; color: var(--muted); flex: 1; }
   .hist-meta .hist-mode { color: var(--accent); font-weight: 500; }
+  .hist-badge { display: inline-block; margin-left: 6px; font-size: 10px; padding: 1px 7px; border-radius: 10px; vertical-align: middle; font-weight: 500; }
+  .hist-badge.synced { color: #4ade80; background: rgba(74,222,128,.12); border: 1px solid rgba(74,222,128,.3); }
+  .hist-badge.local  { color: #d4a72c; background: rgba(212,167,44,.12); border: 1px solid rgba(212,167,44,.3); }
+  .hist-badge.folder { color: var(--accent); background: rgba(108,140,255,.12); border: 1px solid rgba(108,140,255,.3); }
   .hist-meta .hist-prompt { color: var(--text); margin-top: 3px; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
   .hist-meta .hist-time { margin-top: 4px; font-size: 11px; }
   .hist-actions { display: flex; gap: 6px; padding: 0 10px 10px; }
@@ -154,11 +161,21 @@
     本地单页工具：Key 和地址保存在本浏览器，请求从浏览器直接发往你填的地址。请勿部署到公网或分享本文件。
   </div>
 
+  <div id="authBanner" style="display:none; align-items:center; justify-content:space-between; gap:12px; background:rgba(255,107,107,.1); border:1px solid rgba(255,107,107,.4); border-radius:8px; padding:12px 14px; margin-bottom:20px">
+    <span id="authBannerText" style="color:var(--danger); font-size:13px"></span>
+    <button class="btn danger" id="authBtn" style="width:auto; flex:none; white-space:nowrap">授权访问文件夹</button>
+  </div>
+
   <div class="panel" id="historyPanel" style="margin-bottom:20px; display:none">
     <div class="history-head">
       <h2>历史记录</h2>
-      <button class="btn ghost" id="clearHistory">清空历史</button>
+      <div style="display:flex; gap:8px">
+        <button class="btn ghost" id="pickFolder">同步到文件夹</button>
+        <button class="btn ghost" id="changeFolder">更换文件夹</button>
+        <button class="btn ghost" id="clearHistory">清空历史</button>
+      </div>
     </div>
+    <div class="hint" id="folderStatus" style="margin-bottom:12px"></div>
     <div id="historyBody"></div>
   </div>
 
@@ -258,7 +275,41 @@ const $ = id => document.getElementById(id);
 let mode = 'generate';
 let files = []; // {file, url}
 
-// ---- 配置：读取 localStorage，回退到默认 ----
+// ---- IndexedDB 简易键值存储（比 file:// 下的 localStorage 更可靠）----
+function idb() {
+  return new Promise((resolve, reject) => {
+    const r = indexedDB.open('gptimg', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('kv');
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+async function idbSet(k, v) {
+  const db = await idb();
+  return new Promise((res, rej) => {
+    const tx = db.transaction('kv', 'readwrite');
+    tx.objectStore('kv').put(v, k);
+    tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+  });
+}
+async function idbGet(k) {
+  const db = await idb();
+  return new Promise((res, rej) => {
+    const tx = db.transaction('kv', 'readonly');
+    const q = tx.objectStore('kv').get(k);
+    q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error);
+  });
+}
+async function idbDel(k) {
+  const db = await idb();
+  return new Promise((res, rej) => {
+    const tx = db.transaction('kv', 'readwrite');
+    tx.objectStore('kv').delete(k);
+    tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+  });
+}
+
+// ---- 配置：优先 IndexedDB，兼容旧的 localStorage，回退到默认 ----
 const cfg = {
   key:   localStorage.getItem('gptimg_key')   ?? DEFAULT_KEY,
   base:  localStorage.getItem('gptimg_base')  ?? DEFAULT_BASE,
@@ -267,6 +318,21 @@ const cfg = {
 $('apiKey').value  = cfg.key;
 $('apiBase').value = cfg.base;
 $('model').value   = cfg.model;
+
+// 异步从 IndexedDB 恢复（若存在则覆盖上面的值）
+(async () => {
+  try {
+    const saved = await idbGet('cfg');
+    if (saved) {
+      Object.assign(cfg, saved);
+      $('apiKey').value  = cfg.key   ?? '';
+      $('apiBase').value = cfg.base  ?? '';
+      $('model').value   = cfg.model ?? DEFAULT_MODEL;
+    }
+  } catch {}
+  // 有配置时收起设置面板，无配置时展开
+  $('cfgPanel').style.display = (!cfg.key || !cfg.base) ? 'block' : 'none';
+})();
 
 $('toggleCfg').onclick = () => {
   const p = $('cfgPanel');
@@ -278,18 +344,20 @@ $('toggleHistory').onclick = () => {
   p.style.display = show ? 'block' : 'none';
   if (show) renderHistory();
 };
-$('saveCfg').onclick = () => {
+$('saveCfg').onclick = async () => {
   cfg.key   = $('apiKey').value.trim();
   cfg.base  = $('apiBase').value.trim().replace(/\/+$/, '');
   cfg.model = $('model').value.trim() || DEFAULT_MODEL;
-  localStorage.setItem('gptimg_key', cfg.key);
-  localStorage.setItem('gptimg_base', cfg.base);
-  localStorage.setItem('gptimg_model', cfg.model);
+  // 主存 IndexedDB，同时写 localStorage 作兼容
+  try { await idbSet('cfg', { key: cfg.key, base: cfg.base, model: cfg.model }); } catch {}
+  try {
+    localStorage.setItem('gptimg_key', cfg.key);
+    localStorage.setItem('gptimg_base', cfg.base);
+    localStorage.setItem('gptimg_model', cfg.model);
+  } catch {}
   $('cfgHint').textContent = '已保存 ✓';
   setTimeout(() => $('cfgHint').textContent = '', 1500);
 };
-// 首次无配置时自动展开设置面板
-if (!cfg.key || !cfg.base) $('cfgPanel').style.display = 'block';
 
 // 尺寸：选“自定义”时显示输入框
 $('size').addEventListener('change', () => {
@@ -347,7 +415,7 @@ async function run() {
   try {
     const data = mode === 'edit' ? await callEdit(prompt) : await callGenerate(prompt);
     renderResults(data);
-    saveHistory(data, prompt, mode);
+    await saveHistory(data, prompt, mode);
   } catch (err) {
     showErr(err.message || String(err));
   } finally {
@@ -465,39 +533,95 @@ function escapeHtml(s) {
 }
 
 // ====== 历史记录 ======
-const HISTORY_KEY = 'gptimg_history';
-const HISTORY_MAX = 50; // 最多保留条数（单张图为一条）
+// 主存储：IndexedDB（图片二进制 + 元数据，永不弹授权、不失效）
+// 可选：额外同步一份 PNG 到用户选的本地文件夹（File System Access API）
+const FS_SUPPORTED = 'showDirectoryPicker' in window;
+const INDEX_FILE = 'index.json';
+let dirHandle = null;        // 可选的同步文件夹句柄
+let histUrls = [];           // 渲染时创建的 objectURL，重渲染前回收
 
-function loadHistory() {
-  try { return JSON.parse(localStorage.getItem(HISTORY_KEY)) || []; }
-  catch { return []; }
+async function ensurePermission(handle, request) {
+  const opts = { mode: 'readwrite' };
+  if ((await handle.queryPermission(opts)) === 'granted') return true;
+  if (request && (await handle.requestPermission(opts)) === 'granted') return true;
+  return false;
 }
-function persistHistory(list) {
-  try {
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(list));
-  } catch (e) {
-    // localStorage 容量有限（base64 图片较大），超限时丢弃最旧记录后重试
-    while (list.length > 1) {
-      list.pop();
-      try { localStorage.setItem(HISTORY_KEY, JSON.stringify(list)); return; }
-      catch {}
-    }
+
+// 结果项 -> 图片二进制（base64 直接解码；url 则抓取，避免存会失效的地址）
+async function itemToBlob(it) {
+  if (it.b64_json) {
+    const bin = atob(it.b64_json);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return new Blob([arr], { type: 'image/png' });
   }
+  return await (await fetch(it.url)).blob();
 }
 
-function saveHistory(json, prompt, mode) {
+// ---- IndexedDB 主存储 ----
+async function loadIndex() {
+  return (await idbGet('history')) || [];
+}
+async function saveIndex(list) {
+  await idbSet('history', list);
+}
+
+// ---- 可选文件夹同步 ----
+async function folderWrite(name, blob) {
+  const fh = await dirHandle.getFileHandle(name, { create: true });
+  const w = await fh.createWritable();
+  await w.write(blob);
+  await w.close();
+}
+async function folderWriteIndex(list) {
+  const fh = await dirHandle.getFileHandle(INDEX_FILE, { create: true });
+  const w = await fh.createWritable();
+  await w.write(JSON.stringify(list.map(({id,file,prompt,mode,time}) => ({id,file,prompt,mode,time})), null, 2));
+  await w.close();
+}
+async function folderReadIndex() {
+  try {
+    const fh = await dirHandle.getFileHandle(INDEX_FILE);
+    return JSON.parse(await (await fh.getFile()).text()) || [];
+  } catch { return []; }
+}
+async function folderReadBlob(file) {
+  try {
+    const fh = await dirHandle.getFileHandle(file);
+    return await fh.getFile();
+  } catch { return null; }
+}
+
+// 当前文件夹是否已授权可读写
+async function folderReady() {
+  return dirHandle && await ensurePermission(dirHandle, false);
+}
+
+async function saveHistory(json, prompt, mode) {
   const items = json.data || [];
   if (!items.length) return;
-  const list = loadHistory();
+  const list = await loadIndex();
   const ts = Date.now();
-  // 新的放最前面
-  items.forEach((it, i) => {
-    const src = it.b64_json ? 'data:image/png;base64,' + it.b64_json : it.url;
-    list.unshift({ id: ts + '-' + i, src, prompt, mode, time: ts });
-  });
-  if (list.length > HISTORY_MAX) list.length = HISTORY_MAX;
-  persistHistory(list);
-  // 历史面板若已打开则刷新
+  const syncFolder = await folderReady();
+  // 文件夹已有索引（含仅文件夹的旧记录），新条目要合并进去而非覆盖
+  const folderList = syncFolder ? await folderReadIndex() : null;
+  const newEntries = [];
+  for (let i = 0; i < items.length; i++) {
+    const id = ts + '-' + i;
+    const file = `gpt-image-${id}.png`;
+    const blob = await itemToBlob(items[i]);
+    await idbSet('img:' + id, blob);                    // 图片存进 IndexedDB
+    const entry = { id, file, prompt, mode, time: ts };
+    list.unshift(entry);
+    newEntries.push(entry);
+    if (syncFolder) { try { await folderWrite(file, blob); } catch {} } // 同时写文件夹
+  }
+  await saveIndex(list);
+  if (syncFolder) {
+    // 合并：文件夹原有记录 + 本次新增，按时间倒序写回，保留仅文件夹的旧历史
+    const merged = [...newEntries, ...folderList].sort((a, b) => b.time - a.time);
+    try { await folderWriteIndex(merged); } catch {}
+  }
   if ($('historyPanel').style.display !== 'none') renderHistory();
 }
 
@@ -507,46 +631,211 @@ function fmtTime(ts) {
   return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-function renderHistory() {
-  const list = loadHistory();
+function setFolderStatus(msg) { $('folderStatus').textContent = msg || ''; }
+
+// 文件夹未授权时显示醒目红色横幅；未选/已授权则隐藏
+function showAuthBanner(name) {
+  $('authBannerText').textContent = `同步文件夹「${name}」需要重新授权访问，授权前新图不会写入该文件夹。`;
+  $('authBanner').style.display = 'flex';
+}
+function hideAuthBanner() {
+  $('authBanner').style.display = 'none';
+}
+
+function revokeHistUrls() {
+  histUrls.forEach(u => URL.revokeObjectURL(u));
+  histUrls = [];
+}
+
+// 合并两种来源：IndexedDB 历史 + 文件夹 index.json，按 id 去重并打标签
+// 标签：synced=两边都有；local=仅浏览器；folder=仅文件夹
+async function mergedHistory() {
+  const idbList = await loadIndex();
+  const idbIds = new Set(idbList.map(x => x.id));
+  let folderList = [], folderIds = new Set();
+  if (await folderReady()) {
+    folderList = await folderReadIndex();
+    folderIds = new Set(folderList.map(x => x.id));
+  }
+  const map = new Map();
+  for (const it of idbList) map.set(it.id, { ...it, src: 'idb' });
+  for (const it of folderList) {
+    if (map.has(it.id)) map.get(it.id).src = 'both';
+    else map.set(it.id, { ...it, src: 'folder' });
+  }
+  const merged = [...map.values()].sort((a, b) => b.time - a.time);
+  return merged.map(it => ({
+    ...it,
+    inIdb: idbIds.has(it.id),
+    inFolder: folderIds.has(it.id),
+    tag: it.src === 'both' ? 'synced' : (it.src === 'idb' ? 'local' : 'folder'),
+  }));
+}
+
+// 取某条历史的图片：优先 IndexedDB，否则从文件夹读
+async function getHistBlob(item) {
+  if (item.inIdb) {
+    const b = await idbGet('img:' + item.id);
+    if (b) return b;
+  }
+  if (item.inFolder && await folderReady()) {
+    return await folderReadBlob(item.file);
+  }
+  return null;
+}
+
+async function renderHistory() {
   const body = $('historyBody');
+  const list = await mergedHistory();
+  revokeHistUrls();
   if (!list.length) {
     body.innerHTML = '<div class="history-empty">暂无历史记录</div>';
     return;
   }
   const grid = document.createElement('div');
   grid.className = 'history-grid';
-  list.forEach(item => {
+  for (const item of list) {
+    const blob = await getHistBlob(item);
+    if (!blob) continue;
+    const url = URL.createObjectURL(blob);
+    histUrls.push(url);
+    const badgeText = { synced: '已同步', local: '仅缓存', folder: '仅文件夹' }[item.tag];
     const el = document.createElement('div');
     el.className = 'hist-item';
     el.innerHTML = `
-      <img class="hist-img" src="${item.src}" title="点击在新标签打开">
+      <img class="hist-img" src="${url}" title="点击在新标签打开">
       <div class="hist-meta">
         <span class="hist-mode">${item.mode === 'edit' ? '改图' : '文生图'}</span>
+        <span class="hist-badge ${item.tag}">${badgeText}</span>
         <div class="hist-prompt">${escapeHtml(item.prompt || '')}</div>
         <div class="hist-time">${fmtTime(item.time)}</div>
       </div>
       <div class="hist-actions">
         <button class="btn ghost hist-reuse">改这张</button>
-        <a class="btn ghost" href="${item.src}" download="gpt-image-${item.id}.png">下载</a>
+        <a class="btn ghost" href="${url}" download="${item.file}">下载</a>
         <button class="btn ghost hist-del">删除</button>
       </div>`;
-    el.querySelector('.hist-img').onclick = () => window.open(item.src, '_blank');
-    el.querySelector('.hist-reuse').onclick = () => reuseImage(item.src);
-    el.querySelector('.hist-del').onclick = () => {
-      const cur = loadHistory().filter(x => x.id !== item.id);
-      persistHistory(cur);
+    el.querySelector('.hist-img').onclick = () => window.open(url, '_blank');
+    el.querySelector('.hist-reuse').onclick = () => reuseImage(url);
+    el.querySelector('.hist-del').onclick = async () => {
+      // 两边都删
+      if (item.inIdb) {
+        await idbDel('img:' + item.id);
+        await saveIndex((await loadIndex()).filter(x => x.id !== item.id));
+      }
+      if (item.inFolder && await folderReady()) {
+        try { await dirHandle.removeEntry(item.file); } catch {}
+        await folderWriteIndex((await folderReadIndex()).filter(x => x.id !== item.id));
+      }
       renderHistory();
     };
     grid.appendChild(el);
-  });
+  }
   body.innerHTML = '';
   body.appendChild(grid);
 }
 
-$('clearHistory').onclick = () => {
+// 同步到文件夹：已选中则把 IndexedDB 历史增量推过去；未选则先选一个（选完不自动同步）
+async function pickFolder() {
+  if (!FS_SUPPORTED) { setFolderStatus('当前浏览器不支持文件夹同步（需 Chrome / Edge）。历史已存在浏览器中，不影响使用。'); return; }
+  try {
+    if (dirHandle) {
+      // 已有记住的文件夹：请求授权后执行同步（这是显式的同步操作）
+      if (await ensurePermission(dirHandle, true)) {
+        hideAuthBanner();
+        await syncAllToFolder();
+      }
+      return;
+    }
+    // 尚未选文件夹：仅选择并记住，不自动同步
+    dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+    await idbSet('dirHandle', dirHandle);
+    hideAuthBanner();
+    setFolderStatus('已选择文件夹：' + dirHandle.name + '（点「同步到文件夹」可推送历史）');
+    renderHistory();
+  } catch (e) { /* 用户取消 */ }
+}
+
+// 更换文件夹：选一个新文件夹并记住，不自动同步
+async function changeFolder() {
+  if (!FS_SUPPORTED) { setFolderStatus('当前浏览器不支持文件夹同步（需 Chrome / Edge）。'); return; }
+  try {
+    dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+    await idbSet('dirHandle', dirHandle);
+    hideAuthBanner();
+    setFolderStatus('已选择文件夹：' + dirHandle.name + '（点「同步到文件夹」可推送历史）');
+    renderHistory();
+  } catch (e) { /* 用户取消 */ }
+}
+
+// 把 IndexedDB 里现有历史全量增量同步到当前文件夹（文件夹已有的保留，缺的补齐）
+async function syncAllToFolder() {
+  setFolderStatus('正在同步到文件夹「' + dirHandle.name + '」…');
+  const idbList = await loadIndex();
+  const folderList = await folderReadIndex();
+  const folderIds = new Set(folderList.map(x => x.id));
+  let added = 0;
+  // 把 IndexedDB 中文件夹缺失的条目写过去
+  for (const item of idbList) {
+    if (folderIds.has(item.id)) continue;
+    const blob = await idbGet('img:' + item.id);
+    if (blob) {
+      try { await folderWrite(item.file, blob); folderList.push(item); added++; } catch {}
+    }
+  }
+  // 合并后的索引按时间排序写回文件夹
+  folderList.sort((a, b) => b.time - a.time);
+  try { await folderWriteIndex(folderList); } catch {}
+  setFolderStatus(`已同步到文件夹：${dirHandle.name}（新增 ${added} 条，之后新图自动写入）`);
+  renderHistory();
+}
+
+async function restoreFolder() {
+  if (!FS_SUPPORTED) { setFolderStatus(''); return; }
+  try {
+    const h = await idbGet('dirHandle');
+    if (h) {
+      dirHandle = h;
+      const ok = await ensurePermission(h, false);
+      if (ok) {
+        hideAuthBanner();
+        setFolderStatus('同步文件夹：' + h.name);
+        if ($('historyPanel').style.display !== 'none') renderHistory();
+      } else {
+        // 已记住但未授权：显示醒目红色横幅，不在历史区里提示
+        setFolderStatus('');
+        showAuthBanner(h.name);
+      }
+    } else {
+      hideAuthBanner();
+    }
+  } catch {}
+}
+
+// 红色横幅按钮：对已记住的文件夹请求授权
+async function authFolder() {
+  if (!dirHandle) return;
+  if (await ensurePermission(dirHandle, true)) {
+    hideAuthBanner();
+    setFolderStatus('同步文件夹：' + dirHandle.name);
+    renderHistory();
+  }
+}
+
+$('pickFolder').onclick = pickFolder;
+$('changeFolder').onclick = changeFolder;
+$('authBtn').onclick = authFolder;
+restoreFolder();
+
+$('clearHistory').onclick = async () => {
   if (!confirm('确定清空所有历史记录？此操作不可恢复。')) return;
-  localStorage.removeItem(HISTORY_KEY);
+  const list = await loadIndex();
+  for (const item of list) await idbDel('img:' + item.id);
+  await saveIndex([]);
+  if (dirHandle && await ensurePermission(dirHandle, true)) {
+    for (const item of list) { try { await dirHandle.removeEntry(item.file); } catch {} }
+    try { await folderWriteIndex([]); } catch {}
+  }
   renderHistory();
 };
 </script>
